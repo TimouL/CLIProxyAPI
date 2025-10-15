@@ -21,8 +21,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"gopkg.in/yaml.v3"
-
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -58,7 +56,6 @@ type Watcher struct {
 	dispatchCancel  context.CancelFunc
 	storePersister  storePersister
 	mirroredAuthDir string
-	oldConfigYaml   []byte
 }
 
 type stableIDGenerator struct {
@@ -180,7 +177,6 @@ func (w *Watcher) SetConfig(cfg *config.Config) {
 	w.clientsMutex.Lock()
 	defer w.clientsMutex.Unlock()
 	w.config = cfg
-	w.oldConfigYaml, _ = yaml.Marshal(cfg)
 }
 
 // SetAuthUpdateQueue sets the queue used to emit auth updates.
@@ -539,9 +535,7 @@ func (w *Watcher) reloadConfig() bool {
 	}
 
 	w.clientsMutex.Lock()
-	var oldConfig *config.Config
-	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
-	w.oldConfigYaml, _ = yaml.Marshal(newConfig)
+	oldConfig := w.config
 	w.config = newConfig
 	w.clientsMutex.Unlock()
 

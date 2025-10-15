@@ -201,11 +201,36 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 	}
 }
 
+// persistWithUpdater loads config from file, applies updates, and saves back.
+func (h *Handler) persistWithUpdater(c *gin.Context, updater func(*config.Config)) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Load fresh config from file
+	freshCfg, err := config.LoadConfig(h.configFilePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to load config: %v", err)})
+		return false
+	}
+
+	// Apply update
+	updater(freshCfg)
+
+	// Save back to file (Watcher will detect and trigger hot reload)
+	if err := config.SaveConfigPreserveComments(h.configFilePath, freshCfg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
+		return false
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	return true
+}
+
 // persist saves the current in-memory config to disk.
+// Deprecated: Use persistWithUpdater for Management API updates.
 func (h *Handler) persist(c *gin.Context) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// Preserve comments when writing
 	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
@@ -215,7 +240,10 @@ func (h *Handler) persist(c *gin.Context) bool {
 }
 
 // Helper methods for simple types
-func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
+
+// updateBoolFieldInFile loads config from file, updates the field, and saves back.
+// This avoids modifying the in-memory config that Server holds.
+func (h *Handler) updateBoolFieldInFile(c *gin.Context, set func(*config.Config, bool)) {
 	var body struct {
 		Value *bool `json:"value"`
 	}
@@ -224,8 +252,9 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		if err2 := c.ShouldBindJSON(&m); err2 == nil {
 			for _, v := range m {
 				if b, ok := v.(bool); ok {
-					set(b)
-					h.persist(c)
+					h.persistWithUpdater(c, func(cfg *config.Config) {
+						set(cfg, b)
+					})
 					return
 				}
 			}
@@ -233,11 +262,13 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	set(*body.Value)
-	h.persist(c)
+	h.persistWithUpdater(c, func(cfg *config.Config) {
+		set(cfg, *body.Value)
+	})
 }
 
-func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
+// updateIntFieldInFile loads config from file, updates the field, and saves back.
+func (h *Handler) updateIntFieldInFile(c *gin.Context, set func(*config.Config, int)) {
 	var body struct {
 		Value *int `json:"value"`
 	}
@@ -245,11 +276,13 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	set(*body.Value)
-	h.persist(c)
+	h.persistWithUpdater(c, func(cfg *config.Config) {
+		set(cfg, *body.Value)
+	})
 }
 
-func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
+// updateStringFieldInFile loads config from file, updates the field, and saves back.
+func (h *Handler) updateStringFieldInFile(c *gin.Context, set func(*config.Config, string)) {
 	var body struct {
 		Value *string `json:"value"`
 	}
@@ -257,6 +290,7 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	set(*body.Value)
-	h.persist(c)
+	h.persistWithUpdater(c, func(cfg *config.Config) {
+		set(cfg, *body.Value)
+	})
 }

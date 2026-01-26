@@ -18,7 +18,7 @@ permissions:
 env:
   APP_NAME: CLIProxyAPI-Aoao
   GHCR_REGISTRY: ghcr.io
-  GHCR_IMAGE: cli-proxy-api-ForkAoao
+  GHCR_IMAGE: cli-proxy-api-forkaoao
 
 jobs:
   docker:
@@ -46,7 +46,9 @@ jobs:
           set -euo pipefail
           OWNER="${{ github.repository_owner }}"
           OWNER="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          echo "GHCR_REPO=${OWNER}/${{ env.GHCR_IMAGE }}" >> "$GITHUB_ENV"
+          IMAGE="${{ env.GHCR_IMAGE }}"
+          IMAGE="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_REPO=${OWNER}/${IMAGE}" >> "$GITHUB_ENV"
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             VERSION="${{ inputs.version }}"
           elif [[ "${{ github.ref_type }}" == "tag" ]]; then

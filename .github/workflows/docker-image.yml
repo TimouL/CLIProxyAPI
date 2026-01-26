@@ -18,7 +18,7 @@ permissions:
 env:
   APP_NAME: CLIProxyAPI-Aoao
   GHCR_REGISTRY: ghcr.io
-  GHCR_IMAGE: cli-proxy-api
+  GHCR_IMAGE: cli-proxy-api-ForkAoao
 
 jobs:
   docker:

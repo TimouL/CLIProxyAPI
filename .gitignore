@@ -49,3 +49,5 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+cmd/server/static/management.html
+cmd/server/__debug_*

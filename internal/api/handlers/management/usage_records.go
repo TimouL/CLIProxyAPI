@@ -30,6 +30,10 @@ func (h *Handler) GetUsageRecords(c *gin.Context) {
 	query.SortBy = c.Query("sort_by")
 	query.SortOrder = c.Query("sort_order")
 
+	if includeKPIsStr := c.Query("include_kpis"); includeKPIsStr != "" {
+		query.IncludeKPIs = includeKPIsStr == "true" || includeKPIsStr == "1"
+	}
+
 	if successStr := c.Query("success"); successStr != "" {
 		success := successStr == "true" || successStr == "1"
 		query.Success = &success

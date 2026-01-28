@@ -9,7 +9,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	log "github.com/sirupsen/logrus"
 
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
@@ -18,10 +17,10 @@ import (
 // It captures request/response details from the gin context and stores them
 // in the database for later analysis.
 type Plugin struct {
-	store            *Store
-	enabled          atomic.Bool
-	tokenIncrementor TokenIncrementor
-	usageIncrementor UsageIncrementor
+	store                *Store
+	enabled              atomic.Bool
+	tokenIncrementor     TokenIncrementor
+	usageIncrementor     UsageIncrementor
 	candidateIncrementor CandidateIncrementor
 }
 
@@ -211,6 +210,8 @@ func (p *Plugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 		InputTokens:     record.Detail.InputTokens,
 		OutputTokens:    record.Detail.OutputTokens,
 		TotalTokens:     record.Detail.InputTokens + record.Detail.OutputTokens,
+		CachedTokens:    record.Detail.CachedTokens,
+		ReasoningTokens: record.Detail.ReasoningTokens,
 		DurationMs:      durationMs,
 		StatusCode:      statusCode,
 		Success:         success,
@@ -222,15 +223,7 @@ func (p *Plugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 		ResponseBody:    responseBody,
 	}
 
-	// Insert asynchronously to avoid blocking the request
-	go func() {
-		insertCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := p.store.Insert(insertCtx, rec); err != nil {
-			log.WithError(err).Warn("failed to insert usage record")
-		}
-	}()
+	p.store.EnqueueUsageRecord(rec)
 
 	// Increment API key token counts if callback is set
 	if p.tokenIncrementor != nil && record.APIKey != "" {
@@ -287,6 +280,7 @@ func truncateBody(body string, maxLen int) string {
 func Register() {
 	coreusage.RegisterPlugin(DefaultPlugin())
 }
+
 // RecordCandidate records a request candidate for tracing purposes.
 // This should be called during request routing to track all attempts.
 func RecordCandidate(requestID string, provider string, apiKey string, status string, statusCode int, success bool, durationMs int64, errorMessage string, candidateIndex int, retryIndex int) {
@@ -310,15 +304,7 @@ func RecordCandidate(requestID string, provider string, apiKey string, status st
 		RetryIndex:     retryIndex,
 	}
 
-	// Insert asynchronously to avoid blocking the request
-	go func() {
-		insertCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := plugin.store.InsertRequestCandidate(insertCtx, candidate); err != nil {
-			log.WithError(err).Warn("failed to insert request candidate")
-		}
-	}()
+	plugin.store.EnqueueRequestCandidate(candidate)
 
 	// Call the callback if set
 	if plugin.candidateIncrementor != nil {

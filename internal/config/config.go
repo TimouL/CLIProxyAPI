@@ -54,6 +54,10 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageRecordsRetentionDays controls how long the usage records SQLite database keeps data.
+	// Default: 30 days. Set to 0 to keep forever (disable cleanup).
+	UsageRecordsRetentionDays int `yaml:"usage-records-retention-days" json:"usage-records-retention-days"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -512,6 +516,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.UsageStatisticsEnabled = false
+	cfg.UsageRecordsRetentionDays = 30
 	cfg.DisableCooling = false
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
@@ -557,6 +562,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
+	}
+	if cfg.UsageRecordsRetentionDays < 0 {
+		cfg.UsageRecordsRetentionDays = 0
 	}
 
 	// Sync request authentication providers with inline API keys for backwards compatibility.

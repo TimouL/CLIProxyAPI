@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -101,59 +103,80 @@ func ParseTimeParamToTime(param string) time.Time {
 
 // Record represents a single API usage record stored in the database.
 type Record struct {
-	ID              int64             `json:"id"`
-	RequestID       string            `json:"request_id"`
-	Timestamp       time.Time         `json:"timestamp"`
-	IP              string            `json:"ip"`
-	APIKey          string            `json:"api_key"`
-	APIKeyMasked    string            `json:"api_key_masked"`
-	Model           string            `json:"model"`
-	Provider        string            `json:"provider"`
-	IsStreaming     bool              `json:"is_streaming"`
-	InputTokens     int64             `json:"input_tokens"`
-	OutputTokens    int64             `json:"output_tokens"`
-	TotalTokens     int64             `json:"total_tokens"`
-	DurationMs      int64             `json:"duration_ms"`
-	StatusCode      int               `json:"status_code"`
-	Success         bool              `json:"success"`
-	RequestURL      string            `json:"request_url"`
-	RequestMethod   string            `json:"request_method"`
-	RequestHeaders  map[string]string `json:"request_headers,omitempty"`
-	RequestBody     string            `json:"request_body,omitempty"`
-	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
-	ResponseBody    string            `json:"response_body,omitempty"`
+	ID                     int64             `json:"id"`
+	RequestID              string            `json:"request_id"`
+	Timestamp              time.Time         `json:"timestamp"`
+	IP                     string            `json:"ip"`
+	APIKey                 string            `json:"api_key"`
+	APIKeyMasked           string            `json:"api_key_masked"`
+	Model                  string            `json:"model"`
+	Provider               string            `json:"provider"`
+	UpstreamProvider       string            `json:"upstream_provider,omitempty"`
+	UpstreamAPIKeyMasked   string            `json:"upstream_api_key_masked,omitempty"`
+	UpstreamCandidateCount int               `json:"upstream_candidate_count,omitempty"`
+	UpstreamHasRetry       bool              `json:"upstream_has_retry,omitempty"`
+	IsStreaming            bool              `json:"is_streaming"`
+	InputTokens            int64             `json:"input_tokens"`
+	OutputTokens           int64             `json:"output_tokens"`
+	TotalTokens            int64             `json:"total_tokens"`
+	CachedTokens           int64             `json:"cached_tokens"`
+	ReasoningTokens        int64             `json:"reasoning_tokens"`
+	DurationMs             int64             `json:"duration_ms"`
+	StatusCode             int               `json:"status_code"`
+	Success                bool              `json:"success"`
+	RequestURL             string            `json:"request_url"`
+	RequestMethod          string            `json:"request_method"`
+	RequestHeaders         map[string]string `json:"request_headers,omitempty"`
+	RequestBody            string            `json:"request_body,omitempty"`
+	ResponseHeaders        map[string]string `json:"response_headers,omitempty"`
+	ResponseBody           string            `json:"response_body,omitempty"`
 }
 
 // ListQuery defines the query parameters for listing records.
 type ListQuery struct {
-	Page      int    `form:"page"`
-	PageSize  int    `form:"page_size"`
-	APIKey    string `form:"api_key"`
-	Model     string `form:"model"`
-	Provider  string `form:"provider"`
-	StartTime string `form:"start_time"`
-	EndTime   string `form:"end_time"`
-	Success   *bool  `form:"success"`
-	Search    string `form:"search"`
-	SortBy    string `form:"sort_by"`
-	SortOrder string `form:"sort_order"`
+	Page        int    `form:"page"`
+	PageSize    int    `form:"page_size"`
+	APIKey      string `form:"api_key"`
+	Model       string `form:"model"`
+	Provider    string `form:"provider"`
+	StartTime   string `form:"start_time"`
+	EndTime     string `form:"end_time"`
+	Success     *bool  `form:"success"`
+	Search      string `form:"search"`
+	SortBy      string `form:"sort_by"`
+	SortOrder   string `form:"sort_order"`
+	IncludeKPIs bool   `form:"include_kpis"`
 }
 
 // ListResult contains the paginated list of records.
 type ListResult struct {
-	Records    []Record `json:"records"`
-	Total      int64    `json:"total"`
-	Page       int      `json:"page"`
-	PageSize   int      `json:"page_size"`
-	TotalPages int      `json:"total_pages"`
+	Records    []Record   `json:"records"`
+	Total      int64      `json:"total"`
+	Page       int        `json:"page"`
+	PageSize   int        `json:"page_size"`
+	TotalPages int        `json:"total_pages"`
+	KPIs       *UsageKPIs `json:"kpis,omitempty"`
 }
 
 // Store provides SQLite-based storage for usage records.
 type Store struct {
 	db     *sql.DB
 	dbPath string
-	mu     sync.RWMutex
-	closed bool
+
+	closed atomic.Bool
+
+	// Async write queue (best-effort, bounded; drops on overload).
+	writeQueue     chan writeTask
+	writeStop      chan struct{}
+	writeDone      chan struct{}
+	writeDropLogAt atomic.Int64
+
+	// Short TTL caches to protect the DB from frequent dashboard refreshes.
+	listCache             *queryCache
+	modelStatsCache       *queryCache
+	providerStatsCache    *queryCache
+	intervalTimelineCache *queryCache
+	kpisCache             *queryCache
 }
 
 var (
@@ -210,19 +233,42 @@ func NewStore(dataDir string) (*Store, error) {
 
 	dbPath := filepath.Join(dataDir, "usage_records.db")
 
-	db, err := sql.Open("sqlite", dbPath)
+	// SQLite tuning:
+	// - WAL allows concurrent readers with a single writer.
+	// - busy_timeout reduces "database is locked" failures under load.
+	// - synchronous=NORMAL improves throughput (acceptable for analytics-like data).
+	dsn := dbPath + "?" +
+		"_pragma=journal_mode(WAL)&" +
+		"_pragma=synchronous(NORMAL)&" +
+		"_pragma=busy_timeout(5000)&" +
+		"_pragma=temp_store(MEMORY)"
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Configure connection pool for SQLite
-	db.SetMaxOpenConns(1) // SQLite only supports one writer
-	db.SetMaxIdleConns(1)
+	// Configure connection pool.
+	// SQLite is single-writer, but WAL supports multiple concurrent readers.
+	maxConns := runtime.GOMAXPROCS(0)
+	if maxConns < 2 {
+		maxConns = 2
+	}
+	if maxConns > 8 {
+		maxConns = 8
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxLifetime(time.Hour)
 
 	store := &Store{
-		db:     db,
-		dbPath: dbPath,
+		db:                    db,
+		dbPath:                dbPath,
+		listCache:             newQueryCache(2 * time.Second),
+		modelStatsCache:       newQueryCache(3 * time.Second),
+		providerStatsCache:    newQueryCache(3 * time.Second),
+		intervalTimelineCache: newQueryCache(3 * time.Second),
+		kpisCache:             newQueryCache(2 * time.Second),
 	}
 
 	// Initialize schema
@@ -231,8 +277,17 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
+	store.startWriteQueue()
+
 	log.Infof("usage record store initialized at %s", dbPath)
 	return store, nil
+}
+
+func (s *Store) isClosed() bool {
+	if s == nil {
+		return true
+	}
+	return s.closed.Load()
 }
 
 // initSchema creates the database tables if they don't exist.
@@ -251,6 +306,8 @@ func (s *Store) initSchema() error {
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		total_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		reasoning_tokens INTEGER NOT NULL DEFAULT 0,
 		duration_ms INTEGER NOT NULL DEFAULT 0,
 		status_code INTEGER NOT NULL DEFAULT 0,
 		success INTEGER NOT NULL DEFAULT 1,
@@ -268,6 +325,7 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_usage_records_model ON usage_records(model);
 	CREATE INDEX IF NOT EXISTS idx_usage_records_provider ON usage_records(provider);
 	CREATE INDEX IF NOT EXISTS idx_usage_records_request_id ON usage_records(request_id);
+	CREATE INDEX IF NOT EXISTS idx_usage_records_success_timestamp ON usage_records(success, timestamp DESC);
 
 	CREATE TABLE IF NOT EXISTS request_candidates (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,6 +347,8 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_request_candidates_request_id ON request_candidates(request_id);
 	CREATE INDEX IF NOT EXISTS idx_request_candidates_timestamp ON request_candidates(timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_request_candidates_status ON request_candidates(status);
+	CREATE INDEX IF NOT EXISTS idx_request_candidates_best ON request_candidates(request_id, success DESC, candidate_index DESC, retry_index DESC);
+	CREATE INDEX IF NOT EXISTS idx_request_candidates_req_retry ON request_candidates(request_id, retry_index);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -298,16 +358,15 @@ func (s *Store) initSchema() error {
 	// Hotfix/Migration: Add ip column if it doesn't exist
 	// Ignore errors as column might already exist
 	_, _ = s.db.Exec("ALTER TABLE usage_records ADD COLUMN ip TEXT NOT NULL DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE usage_records ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE usage_records ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0")
 
 	return nil
 }
 
 // Insert adds a new usage record to the database.
 func (s *Store) Insert(ctx context.Context, record *Record) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return fmt.Errorf("store is closed")
 	}
 
@@ -325,9 +384,10 @@ func (s *Store) Insert(ctx context.Context, record *Record) error {
 	INSERT INTO usage_records (
 		request_id, timestamp, ip, api_key, api_key_masked, model, provider,
 		is_streaming, input_tokens, output_tokens, total_tokens,
+		cached_tokens, reasoning_tokens,
 		duration_ms, status_code, success, request_url, request_method,
 		request_headers, request_body, response_headers, response_body
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isStreaming := 0
@@ -351,6 +411,8 @@ func (s *Store) Insert(ctx context.Context, record *Record) error {
 		record.InputTokens,
 		record.OutputTokens,
 		record.TotalTokens,
+		record.CachedTokens,
+		record.ReasoningTokens,
 		record.DurationMs,
 		record.StatusCode,
 		success,
@@ -373,10 +435,7 @@ func (s *Store) Insert(ctx context.Context, record *Record) error {
 
 // List retrieves a paginated list of usage records.
 func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -389,6 +448,66 @@ func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) 
 	}
 	if query.PageSize > 100 {
 		query.PageSize = 100
+	}
+
+	cacheKey := listCacheKey(query)
+	value, err := s.listCache.get(cacheKey, func() (any, error) {
+		return s.listUncached(ctx, query)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, ok := value.(*ListResult)
+	if !ok || result == nil {
+		return nil, fmt.Errorf("unexpected list cache value type")
+	}
+	return result, nil
+}
+
+func listCacheKey(query ListQuery) string {
+	var b strings.Builder
+	b.Grow(256)
+
+	b.WriteString("page=")
+	b.WriteString(strconv.Itoa(query.Page))
+	b.WriteString("&page_size=")
+	b.WriteString(strconv.Itoa(query.PageSize))
+	b.WriteString("&api_key=")
+	b.WriteString(query.APIKey)
+	b.WriteString("&model=")
+	b.WriteString(query.Model)
+	b.WriteString("&provider=")
+	b.WriteString(query.Provider)
+	b.WriteString("&start_time=")
+	b.WriteString(query.StartTime)
+	b.WriteString("&end_time=")
+	b.WriteString(query.EndTime)
+	b.WriteString("&search=")
+	b.WriteString(query.Search)
+	b.WriteString("&sort_by=")
+	b.WriteString(query.SortBy)
+	b.WriteString("&sort_order=")
+	b.WriteString(query.SortOrder)
+	b.WriteString("&include_kpis=")
+	if query.IncludeKPIs {
+		b.WriteString("1")
+	} else {
+		b.WriteString("0")
+	}
+	b.WriteString("&success=")
+	if query.Success == nil {
+		b.WriteString("any")
+	} else if *query.Success {
+		b.WriteString("1")
+	} else {
+		b.WriteString("0")
+	}
+	return b.String()
+}
+
+func (s *Store) listUncached(ctx context.Context, query ListQuery) (*ListResult, error) {
+	if s.isClosed() {
+		return nil, fmt.Errorf("store is closed")
 	}
 
 	// Build WHERE clause
@@ -432,6 +551,8 @@ func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) 
 	if len(conditions) > 0 {
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
+	baseArgs := make([]interface{}, len(args))
+	copy(baseArgs, args)
 
 	// Count total records
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM usage_records %s", whereClause)
@@ -458,9 +579,34 @@ func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) 
 	offset := (query.Page - 1) * query.PageSize
 	selectQuery := fmt.Sprintf(`
 		SELECT id, request_id, timestamp, ip, api_key, api_key_masked, model, provider,
-			is_streaming, input_tokens, output_tokens, total_tokens,
-			duration_ms, status_code, success, request_url, request_method,
-			request_headers, request_body, response_headers, response_body
+			COALESCE((
+				SELECT provider
+				FROM request_candidates rc
+				WHERE rc.request_id = usage_records.request_id
+				ORDER BY rc.success DESC, rc.candidate_index DESC, rc.retry_index DESC
+				LIMIT 1
+			), '') AS upstream_provider,
+			COALESCE((
+				SELECT api_key_masked
+				FROM request_candidates rc
+				WHERE rc.request_id = usage_records.request_id
+				ORDER BY rc.success DESC, rc.candidate_index DESC, rc.retry_index DESC
+				LIMIT 1
+			), '') AS upstream_api_key_masked,
+			(
+				SELECT COUNT(*)
+				FROM request_candidates rc
+				WHERE rc.request_id = usage_records.request_id
+			) AS upstream_candidate_count,
+			(
+				SELECT CASE WHEN EXISTS(
+					SELECT 1
+					FROM request_candidates rc
+					WHERE rc.request_id = usage_records.request_id AND rc.retry_index > 0
+				) THEN 1 ELSE 0 END
+			) AS upstream_has_retry,
+			is_streaming, input_tokens, output_tokens, total_tokens, cached_tokens, reasoning_tokens,
+			duration_ms, status_code, success, request_url, request_method
 		FROM usage_records %s
 		ORDER BY %s %s
 		LIMIT ? OFFSET ?
@@ -478,14 +624,14 @@ func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) 
 		var r Record
 		var isStreaming, success int
 		var timestamp string
-		var reqHeadersJSON, respHeadersJSON string
+		var upstreamHasRetry int
 
 		err := rows.Scan(
 			&r.ID, &r.RequestID, &timestamp, &r.IP, &r.APIKey, &r.APIKeyMasked,
-			&r.Model, &r.Provider, &isStreaming, &r.InputTokens,
-			&r.OutputTokens, &r.TotalTokens, &r.DurationMs, &r.StatusCode,
+			&r.Model, &r.Provider, &r.UpstreamProvider, &r.UpstreamAPIKeyMasked, &r.UpstreamCandidateCount, &upstreamHasRetry,
+			&isStreaming, &r.InputTokens,
+			&r.OutputTokens, &r.TotalTokens, &r.CachedTokens, &r.ReasoningTokens, &r.DurationMs, &r.StatusCode,
 			&success, &r.RequestURL, &r.RequestMethod,
-			&reqHeadersJSON, &r.RequestBody, &respHeadersJSON, &r.ResponseBody,
 		)
 		if err != nil {
 			log.WithError(err).Warn("failed to scan record")
@@ -501,13 +647,9 @@ func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) 
 		}
 		r.IsStreaming = isStreaming == 1
 		r.Success = success == 1
-
-		// Parse headers JSON
-		if err := json.Unmarshal([]byte(reqHeadersJSON), &r.RequestHeaders); err != nil {
-			r.RequestHeaders = make(map[string]string)
-		}
-		if err := json.Unmarshal([]byte(respHeadersJSON), &r.ResponseHeaders); err != nil {
-			r.ResponseHeaders = make(map[string]string)
+		r.UpstreamHasRetry = upstreamHasRetry == 1
+		if r.UpstreamProvider == "" {
+			r.UpstreamProvider = r.Provider
 		}
 
 		records = append(records, r)
@@ -515,27 +657,61 @@ func (s *Store) List(ctx context.Context, query ListQuery) (*ListResult, error) 
 
 	totalPages := int((total + int64(query.PageSize) - 1) / int64(query.PageSize))
 
-	return &ListResult{
+	result := &ListResult{
 		Records:    records,
 		Total:      total,
 		Page:       query.Page,
 		PageSize:   query.PageSize,
 		TotalPages: totalPages,
-	}, nil
+	}
+
+	if query.IncludeKPIs {
+		kpis, err := s.GetUsageKPIs(ctx, whereClause, baseArgs, query.StartTime, query.EndTime)
+		if err != nil {
+			log.WithError(err).Warn("failed to compute usage kpis")
+		} else {
+			result.KPIs = kpis
+		}
+	}
+
+	return result, nil
 }
 
 // GetByID retrieves a single record by ID including full request/response details.
 func (s *Store) GetByID(ctx context.Context, id int64) (*Record, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
 	query := `
 		SELECT id, request_id, timestamp, ip, api_key, api_key_masked, model, provider,
-			is_streaming, input_tokens, output_tokens, total_tokens,
+			COALESCE((
+				SELECT provider
+				FROM request_candidates rc
+				WHERE rc.request_id = usage_records.request_id
+				ORDER BY rc.success DESC, rc.candidate_index DESC, rc.retry_index DESC
+				LIMIT 1
+			), '') AS upstream_provider,
+			COALESCE((
+				SELECT api_key_masked
+				FROM request_candidates rc
+				WHERE rc.request_id = usage_records.request_id
+				ORDER BY rc.success DESC, rc.candidate_index DESC, rc.retry_index DESC
+				LIMIT 1
+			), '') AS upstream_api_key_masked,
+			(
+				SELECT COUNT(*)
+				FROM request_candidates rc
+				WHERE rc.request_id = usage_records.request_id
+			) AS upstream_candidate_count,
+			(
+				SELECT CASE WHEN EXISTS(
+					SELECT 1
+					FROM request_candidates rc
+					WHERE rc.request_id = usage_records.request_id AND rc.retry_index > 0
+				) THEN 1 ELSE 0 END
+			) AS upstream_has_retry,
+			is_streaming, input_tokens, output_tokens, total_tokens, cached_tokens, reasoning_tokens,
 			duration_ms, status_code, success, request_url, request_method,
 			request_headers, request_body, response_headers, response_body
 		FROM usage_records
@@ -546,11 +722,13 @@ func (s *Store) GetByID(ctx context.Context, id int64) (*Record, error) {
 	var isStreaming, success int
 	var timestamp string
 	var reqHeadersJSON, respHeadersJSON string
+	var upstreamHasRetry int
 
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
 		&r.ID, &r.RequestID, &timestamp, &r.IP, &r.APIKey, &r.APIKeyMasked,
-		&r.Model, &r.Provider, &isStreaming, &r.InputTokens,
-		&r.OutputTokens, &r.TotalTokens, &r.DurationMs, &r.StatusCode,
+		&r.Model, &r.Provider, &r.UpstreamProvider, &r.UpstreamAPIKeyMasked, &r.UpstreamCandidateCount, &upstreamHasRetry,
+		&isStreaming, &r.InputTokens,
+		&r.OutputTokens, &r.TotalTokens, &r.CachedTokens, &r.ReasoningTokens, &r.DurationMs, &r.StatusCode,
 		&success, &r.RequestURL, &r.RequestMethod,
 		&reqHeadersJSON, &r.RequestBody, &respHeadersJSON, &r.ResponseBody,
 	)
@@ -570,6 +748,10 @@ func (s *Store) GetByID(ctx context.Context, id int64) (*Record, error) {
 	}
 	r.IsStreaming = isStreaming == 1
 	r.Success = success == 1
+	r.UpstreamHasRetry = upstreamHasRetry == 1
+	if r.UpstreamProvider == "" {
+		r.UpstreamProvider = r.Provider
+	}
 
 	if err := json.Unmarshal([]byte(reqHeadersJSON), &r.RequestHeaders); err != nil {
 		r.RequestHeaders = make(map[string]string)
@@ -583,14 +765,11 @@ func (s *Store) GetByID(ctx context.Context, id int64) (*Record, error) {
 
 // DeleteOlderThan removes records older than the specified duration.
 func (s *Store) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return 0, fmt.Errorf("store is closed")
 	}
 
-	cutoff := time.Now().Add(-age)
+	cutoff := time.Now().Add(-age).Format(time.RFC3339)
 	result, err := s.db.ExecContext(ctx, "DELETE FROM usage_records WHERE timestamp < ?", cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete old records: %w", err)
@@ -601,14 +780,14 @@ func (s *Store) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, 
 
 // Close closes the database connection.
 func (s *Store) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
+	if s == nil {
+		return nil
+	}
+	if s.closed.Swap(true) {
 		return nil
 	}
 
-	s.closed = true
+	s.stopWriteQueue()
 	return s.db.Close()
 }
 
@@ -640,10 +819,7 @@ type ActivityHeatmap struct {
 
 // GetActivityHeatmap returns activity data for the heatmap (last N days).
 func (s *Store) GetActivityHeatmap(ctx context.Context, days int) (*ActivityHeatmap, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -741,10 +917,26 @@ type ModelStatsResult struct {
 
 // GetModelStats returns usage statistics grouped by model.
 func (s *Store) GetModelStats(ctx context.Context, startTime, endTime string) (*ModelStatsResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if s.isClosed() {
+		return nil, fmt.Errorf("store is closed")
+	}
 
-	if s.closed {
+	cacheKey := startTime + "|" + endTime
+	value, err := s.modelStatsCache.get(cacheKey, func() (any, error) {
+		return s.getModelStatsUncached(ctx, startTime, endTime)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, ok := value.(*ModelStatsResult)
+	if !ok || result == nil {
+		return nil, fmt.Errorf("unexpected model stats cache value type")
+	}
+	return result, nil
+}
+
+func (s *Store) getModelStatsUncached(ctx context.Context, startTime, endTime string) (*ModelStatsResult, error) {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -830,10 +1022,7 @@ type DistinctOptionsResult struct {
 }
 
 func (s *Store) GetDistinctOptions(ctx context.Context, startTime, endTime string) (*DistinctOptionsResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -893,10 +1082,26 @@ func queryDistinctStrings(ctx context.Context, db *sql.DB, query string, args ..
 
 // GetProviderStats returns usage statistics grouped by provider.
 func (s *Store) GetProviderStats(ctx context.Context, startTime, endTime string) (*ProviderStatsResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if s.isClosed() {
+		return nil, fmt.Errorf("store is closed")
+	}
 
-	if s.closed {
+	cacheKey := startTime + "|" + endTime
+	value, err := s.providerStatsCache.get(cacheKey, func() (any, error) {
+		return s.getProviderStatsUncached(ctx, startTime, endTime)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, ok := value.(*ProviderStatsResult)
+	if !ok || result == nil {
+		return nil, fmt.Errorf("unexpected provider stats cache value type")
+	}
+	return result, nil
+}
+
+func (s *Store) getProviderStatsUncached(ctx context.Context, startTime, endTime string) (*ProviderStatsResult, error) {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -970,12 +1175,36 @@ type UsageSummary struct {
 	UniqueProviders int64   `json:"unique_providers"`
 }
 
+type KPITrendPoint struct {
+	T string `json:"t"`
+	V int64  `json:"v"`
+}
+
+// UsageKPIs contains lightweight KPI metrics for the usage records page.
+type UsageKPIs struct {
+	TotalRequests   int64 `json:"total_requests"`
+	SuccessRequests int64 `json:"success_requests"`
+	FailureRequests int64 `json:"failure_requests"`
+
+	TotalTokens     int64 `json:"total_tokens"`
+	CachedTokens    int64 `json:"cached_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+
+	RPM int64 `json:"rpm"`
+	TPM int64 `json:"tpm"`
+
+	TrendBucket   string          `json:"trend_bucket"` // hour | day
+	RequestsTrend []KPITrendPoint `json:"requests_trend"`
+	TokensTrend   []KPITrendPoint `json:"tokens_trend"`
+	RPMTrend      []KPITrendPoint `json:"rpm_trend"`
+	TPMTrend      []KPITrendPoint `json:"tpm_trend"`
+
+	GeneratedAt string `json:"generated_at"`
+}
+
 // GetUsageSummary returns overall usage summary.
 func (s *Store) GetUsageSummary(ctx context.Context, startTime, endTime string) (*UsageSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -1028,6 +1257,215 @@ func (s *Store) GetUsageSummary(ctx context.Context, startTime, endTime string) 
 	return &summary, nil
 }
 
+func (s *Store) GetUsageKPIs(ctx context.Context, whereClause string, whereArgs []interface{}, startTime, endTime string) (*UsageKPIs, error) {
+	if s.isClosed() {
+		return nil, fmt.Errorf("store is closed")
+	}
+
+	cacheKey := whereClause + "|" + fmt.Sprint(whereArgs) + "|" + startTime + "|" + endTime
+	value, err := s.kpisCache.get(cacheKey, func() (any, error) {
+		return s.getUsageKPIsUncached(ctx, whereClause, whereArgs, startTime, endTime)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, ok := value.(*UsageKPIs)
+	if !ok || result == nil {
+		return nil, fmt.Errorf("unexpected usage kpis cache value type")
+	}
+	return result, nil
+}
+
+func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, whereArgs []interface{}, startTime, endTime string) (*UsageKPIs, error) {
+	if s.isClosed() {
+		return nil, fmt.Errorf("store is closed")
+	}
+
+	kpis := &UsageKPIs{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+	}
+
+	// Totals (based on the same filters as the list endpoint)
+	totalsQuery := fmt.Sprintf(`
+		SELECT
+			COUNT(*) as total_requests,
+			COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) as success_requests,
+			COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) as failure_requests,
+			COALESCE(SUM(input_tokens + output_tokens + cached_tokens + reasoning_tokens), 0) as total_tokens,
+			COALESCE(SUM(cached_tokens), 0) as cached_tokens,
+			COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+		FROM usage_records
+		%s
+	`, whereClause)
+
+	if err := s.db.QueryRowContext(ctx, totalsQuery, whereArgs...).Scan(
+		&kpis.TotalRequests,
+		&kpis.SuccessRequests,
+		&kpis.FailureRequests,
+		&kpis.TotalTokens,
+		&kpis.CachedTokens,
+		&kpis.ReasoningTokens,
+	); err != nil {
+		return nil, fmt.Errorf("failed to query usage kpis totals: %w", err)
+	}
+
+	// Determine time window for trends.
+	trendStart := ParseTimeParamToTime(startTime)
+	trendEnd := ParseTimeParamToTime(endTime)
+	if trendEnd.IsZero() {
+		trendEnd = time.Now()
+	}
+	if trendStart.IsZero() {
+		trendStart = trendEnd.Add(-24 * time.Hour)
+	}
+	if trendStart.After(trendEnd) {
+		trendStart, trendEnd = trendEnd, trendStart
+	}
+
+	// Choose bucket size for the compact sparkline.
+	bucket := "hour"
+	if trendEnd.Sub(trendStart) > 48*time.Hour {
+		bucket = "day"
+	}
+	kpis.TrendBucket = bucket
+
+	type aggRow struct {
+		key      string
+		requests int64
+		tokens   int64
+	}
+	aggMapRequests := make(map[string]int64)
+	aggMapTokens := make(map[string]int64)
+
+	keyExpr := "substr(timestamp, 1, 13)"
+	if bucket == "day" {
+		keyExpr = "substr(timestamp, 1, 10)"
+	}
+	trendQuery := fmt.Sprintf(`
+		SELECT
+			%s as bucket_key,
+			COUNT(*) as requests,
+			COALESCE(SUM(input_tokens + output_tokens + cached_tokens + reasoning_tokens), 0) as tokens
+		FROM usage_records
+		%s
+		GROUP BY bucket_key
+		ORDER BY bucket_key ASC
+	`, keyExpr, whereClause)
+
+	rows, err := s.db.QueryContext(ctx, trendQuery, whereArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query usage kpis trend: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r aggRow
+		if err := rows.Scan(&r.key, &r.requests, &r.tokens); err != nil {
+			continue
+		}
+		label := r.key
+		if bucket == "hour" {
+			label = strings.Replace(r.key, "T", " ", 1) + ":00"
+		}
+		aggMapRequests[label] = r.requests
+		aggMapTokens[label] = r.tokens
+	}
+
+	if bucket == "day" {
+		startDay := time.Date(trendStart.Year(), trendStart.Month(), trendStart.Day(), 0, 0, 0, 0, trendStart.Location())
+		endDay := time.Date(trendEnd.Year(), trendEnd.Month(), trendEnd.Day(), 0, 0, 0, 0, trendEnd.Location())
+		for d := startDay; !d.After(endDay); d = d.AddDate(0, 0, 1) {
+			label := d.Format("2006-01-02")
+			kpis.RequestsTrend = append(kpis.RequestsTrend, KPITrendPoint{T: label, V: aggMapRequests[label]})
+			kpis.TokensTrend = append(kpis.TokensTrend, KPITrendPoint{T: label, V: aggMapTokens[label]})
+		}
+	} else {
+		startHour := trendStart.Truncate(time.Hour)
+		endHour := trendEnd.Truncate(time.Hour)
+		for h := startHour; !h.After(endHour); h = h.Add(time.Hour) {
+			label := h.Format("2006-01-02 15:00")
+			kpis.RequestsTrend = append(kpis.RequestsTrend, KPITrendPoint{T: label, V: aggMapRequests[label]})
+			kpis.TokensTrend = append(kpis.TokensTrend, KPITrendPoint{T: label, V: aggMapTokens[label]})
+		}
+	}
+
+	// RPM/TPM: based on the last 60 seconds up to endTime (or now if endTime not provided).
+	const rpmWindowSeconds = 60
+	windowEnd := trendEnd
+	windowStart := windowEnd.Add(-rpmWindowSeconds * time.Second)
+
+	rpmClause := strings.TrimSpace(whereClause)
+	rpmArgs := append([]interface{}{}, whereArgs...)
+	if rpmClause == "" {
+		rpmClause = "WHERE timestamp >= ? AND timestamp <= ?"
+	} else {
+		rpmClause = rpmClause + " AND timestamp >= ? AND timestamp <= ?"
+	}
+	rpmArgs = append(rpmArgs, windowStart.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+
+	rpmQuery := fmt.Sprintf(`SELECT COUNT(*) FROM usage_records %s`, rpmClause)
+	if err := s.db.QueryRowContext(ctx, rpmQuery, rpmArgs...).Scan(&kpis.RPM); err != nil {
+		return nil, fmt.Errorf("failed to query rpm: %w", err)
+	}
+
+	tpmQuery := fmt.Sprintf(`SELECT COALESCE(SUM(input_tokens + output_tokens + cached_tokens + reasoning_tokens), 0) FROM usage_records %s`, rpmClause)
+	if err := s.db.QueryRowContext(ctx, tpmQuery, rpmArgs...).Scan(&kpis.TPM); err != nil {
+		return nil, fmt.Errorf("failed to query tpm: %w", err)
+	}
+
+	// RPM/TPM trend: last 60 minutes (per minute buckets).
+	const trendMinutes = 60
+	minEnd := windowEnd.Truncate(time.Minute)
+	minStart := minEnd.Add(-time.Duration(trendMinutes-1) * time.Minute)
+
+	minClause := strings.TrimSpace(whereClause)
+	minArgs := append([]interface{}{}, whereArgs...)
+	if minClause == "" {
+		minClause = "WHERE timestamp >= ? AND timestamp <= ?"
+	} else {
+		minClause = minClause + " AND timestamp >= ? AND timestamp <= ?"
+	}
+	minArgs = append(minArgs, minStart.Format(time.RFC3339), minEnd.Format(time.RFC3339))
+
+	minuteQuery := fmt.Sprintf(`
+		SELECT
+			substr(timestamp, 1, 16) as minute_key,
+			COUNT(*) as requests,
+			COALESCE(SUM(input_tokens + output_tokens + cached_tokens + reasoning_tokens), 0) as tokens
+		FROM usage_records
+		%s
+		GROUP BY minute_key
+		ORDER BY minute_key ASC
+	`, minClause)
+
+	minRows, err := s.db.QueryContext(ctx, minuteQuery, minArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query rpm/tpm trend: %w", err)
+	}
+	defer minRows.Close()
+
+	minReqMap := make(map[string]int64)
+	minTokMap := make(map[string]int64)
+	for minRows.Next() {
+		var key string
+		var req, tok int64
+		if err := minRows.Scan(&key, &req, &tok); err != nil {
+			continue
+		}
+		label := strings.Replace(key, "T", " ", 1)
+		minReqMap[label] = req
+		minTokMap[label] = tok
+	}
+
+	for t := minStart; !t.After(minEnd); t = t.Add(time.Minute) {
+		label := t.Format("2006-01-02 15:04")
+		kpis.RPMTrend = append(kpis.RPMTrend, KPITrendPoint{T: label, V: minReqMap[label]})
+		kpis.TPMTrend = append(kpis.TPMTrend, KPITrendPoint{T: label, V: minTokMap[label]})
+	}
+
+	return kpis, nil
+}
+
 // RequestTimelinePoint represents a single point in the hourly request timeline.
 type RequestTimelinePoint struct {
 	Hour     string `json:"hour"`     // Format: "2006-01-02 15:00"
@@ -1056,10 +1494,7 @@ type APIKeyStats struct {
 // GetAPIKeyStats returns aggregated statistics for all API keys from the usage records.
 // This provides persistent data that survives server restarts.
 func (s *Store) GetAPIKeyStats(ctx context.Context) (map[string]*APIKeyStats, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -1098,10 +1533,7 @@ func (s *Store) GetAPIKeyStats(ctx context.Context) (map[string]*APIKeyStats, er
 
 // GetRequestTimeline returns hourly request distribution for timeline visualization.
 func (s *Store) GetRequestTimeline(ctx context.Context, startTime, endTime string) (*RequestTimelineResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -1229,10 +1661,7 @@ type IntervalTimelineResult struct {
 // GetIntervalTimeline returns request interval data for scatter chart visualization.
 // It calculates the time interval between consecutive requests.
 func (s *Store) GetIntervalTimeline(ctx context.Context, hours int, limit int) (*IntervalTimelineResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -1249,25 +1678,48 @@ func (s *Store) GetIntervalTimeline(ctx context.Context, hours int, limit int) (
 		limit = 10000
 	}
 
-	startTime := time.Now().Add(-time.Duration(hours) * time.Hour)
+	cacheKey := strconv.Itoa(hours) + "|" + strconv.Itoa(limit)
+	value, err := s.intervalTimelineCache.get(cacheKey, func() (any, error) {
+		return s.getIntervalTimelineUncached(ctx, hours, limit)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, ok := value.(*IntervalTimelineResult)
+	if !ok || result == nil {
+		return nil, fmt.Errorf("unexpected interval timeline cache value type")
+	}
+	return result, nil
+}
 
-	// Debug: log the time range being queried
-	fmt.Printf("GetIntervalTimeline: querying from %s to %s (hours=%d)\n",
-		startTime.Format(time.RFC3339),
-		time.Now().Format(time.RFC3339),
-		hours)
+func (s *Store) getIntervalTimelineUncached(ctx context.Context, hours int, limit int) (*IntervalTimelineResult, error) {
+	if s.isClosed() {
+		return nil, fmt.Errorf("store is closed")
+	}
 
-	// Query all records in the time range, ordered by timestamp
+	const oversampleFactor = 5
+	maxRecords := limit*oversampleFactor + 1
+	if maxRecords < 2 {
+		maxRecords = 2
+	}
+	if maxRecords > 200000 {
+		maxRecords = 200000
+	}
+
+	now := time.Now()
+	startTime := now.Add(-time.Duration(hours) * time.Hour)
+
+	// Bound the scan: fetch only the most recent records in the window.
+	// We will sample down to `limit` points after interval filtering.
 	query := `
 		SELECT timestamp, model
 		FROM usage_records
 		WHERE timestamp >= ? AND success = 1
-		ORDER BY timestamp ASC
+		ORDER BY timestamp DESC
+		LIMIT ?
 	`
 
-	fmt.Printf("GetIntervalTimeline: executing query with startTime=%s\n", startTime.Format(time.RFC3339))
-
-	rows, err := s.db.QueryContext(ctx, query, startTime.Format(time.RFC3339))
+	rows, err := s.db.QueryContext(ctx, query, startTime.Format(time.RFC3339), maxRecords)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query interval timeline: %w", err)
 	}
@@ -1278,7 +1730,7 @@ func (s *Store) GetIntervalTimeline(ctx context.Context, hours int, limit int) (
 		model     string
 	}
 
-	var records []recordData
+	records := make([]recordData, 0, maxRecords)
 	for rows.Next() {
 		var timestampStr, model string
 		if err := rows.Scan(&timestampStr, &model); err != nil {
@@ -1295,34 +1747,35 @@ func (s *Store) GetIntervalTimeline(ctx context.Context, hours int, limit int) (
 		if ts.IsZero() {
 			continue
 		}
-
 		records = append(records, recordData{timestamp: ts, model: model})
 	}
 
-	// Calculate intervals between consecutive requests
-	var points []IntervalTimelinePoint
+	// Reverse to chronological order.
+	for i, j := 0, len(records)-1; i < j; i, j = i+1, j-1 {
+		records[i], records[j] = records[j], records[i]
+	}
+
+	// Calculate intervals between consecutive requests.
+	points := make([]IntervalTimelinePoint, 0, minInt(limit, len(records)))
 	modelsSet := make(map[string]bool)
 
 	for i := 1; i < len(records); i++ {
 		interval := records[i].timestamp.Sub(records[i-1].timestamp).Minutes()
-
-		// Only include intervals <= 120 minutes (2 hours)
 		if interval > 120 {
 			continue
 		}
 
 		points = append(points, IntervalTimelinePoint{
 			X:     records[i].timestamp.Format(time.RFC3339),
-			Y:     float64(int(interval*100)) / 100, // Round to 2 decimal places
+			Y:     float64(int(interval*100)) / 100, // Round to 2 decimals
 			Model: records[i].model,
 		})
-
 		if records[i].model != "" {
 			modelsSet[records[i].model] = true
 		}
 	}
 
-	// Apply limit if needed (sample evenly)
+	// Apply limit if needed (sample evenly).
 	if len(points) > limit {
 		step := float64(len(points)) / float64(limit)
 		sampled := make([]IntervalTimelinePoint, 0, limit)
@@ -1335,18 +1788,9 @@ func (s *Store) GetIntervalTimeline(ctx context.Context, hours int, limit int) (
 		points = sampled
 	}
 
-	// Convert models set to slice
-	var models []string
+	models := make([]string, 0, len(modelsSet))
 	for model := range modelsSet {
 		models = append(models, model)
-	}
-
-	// Debug: log the results
-	fmt.Printf("GetIntervalTimeline: found %d records, generated %d points\n", len(records), len(points))
-	if len(records) > 0 {
-		fmt.Printf("GetIntervalTimeline: first record at %s, last record at %s\n",
-			records[0].timestamp.Format(time.RFC3339),
-			records[len(records)-1].timestamp.Format(time.RFC3339))
 	}
 
 	return &IntervalTimelineResult{
@@ -1376,10 +1820,7 @@ type RequestCandidate struct {
 
 // GetRequestCandidates retrieves all candidate records for a specific request ID.
 func (s *Store) GetRequestCandidates(ctx context.Context, requestID string) ([]RequestCandidate, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return nil, fmt.Errorf("store is closed")
 	}
 
@@ -1431,10 +1872,7 @@ func (s *Store) GetRequestCandidates(ctx context.Context, requestID string) ([]R
 
 // InsertRequestCandidate adds a new request candidate record.
 func (s *Store) InsertRequestCandidate(ctx context.Context, candidate *RequestCandidate) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
+	if s.isClosed() {
 		return fmt.Errorf("store is closed")
 	}
 

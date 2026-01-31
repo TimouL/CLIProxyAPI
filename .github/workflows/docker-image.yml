@@ -21,15 +21,13 @@ env:
   GHCR_IMAGE: cli-proxy-api-fork-aoao
 
 jobs:
-  docker:
+  docker_amd64:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -60,18 +58,112 @@ jobs:
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
-      - name: Build and push
+      - name: Build and push (amd64)
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: |
-            linux/amd64
-            linux/arm64
+          platforms: linux/amd64
           push: true
           build-args: |
             VERSION=${{ env.VERSION }}
             COMMIT=${{ env.COMMIT }}
             BUILD_DATE=${{ env.BUILD_DATE }}
           tags: |
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_REPO }}:latest
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_REPO }}:${{ env.VERSION }}
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_REPO }}:latest-amd64
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_REPO }}:${{ env.VERSION }}-amd64
+
+  docker_arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Build Metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          OWNER="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${{ env.GHCR_IMAGE }}"
+          IMAGE="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_REPO=${OWNER}/${IMAGE}" >> "$GITHUB_ENV"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Build and push (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_REPO }}:latest-arm64
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_REPO }}:${{ env.VERSION }}-arm64
+
+  docker_manifest:
+    runs-on: ubuntu-latest
+    needs:
+      - docker_amd64
+      - docker_arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Build Metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          OWNER="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${{ env.GHCR_IMAGE }}"
+          IMAGE="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_REPO=${OWNER}/${IMAGE}" >> "$GITHUB_ENV"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Create and push multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            --tag "${GHCR_REGISTRY}/${GHCR_REPO}:latest" \
+            "${GHCR_REGISTRY}/${GHCR_REPO}:latest-amd64" \
+            "${GHCR_REGISTRY}/${GHCR_REPO}:latest-arm64"
+          docker buildx imagetools create \
+            --tag "${GHCR_REGISTRY}/${GHCR_REPO}:${VERSION}" \
+            "${GHCR_REGISTRY}/${GHCR_REPO}:${VERSION}-amd64" \
+            "${GHCR_REGISTRY}/${GHCR_REPO}:${VERSION}-arm64"

@@ -137,6 +137,10 @@ func TestAmpModule_Register_InvalidUpstream(t *testing.T) {
 }
 
 func TestAmpModule_OnConfigUpdated_CacheInvalidation(t *testing.T) {
+	// Ensure environment variable doesn't override file-based secret source.
+	// This test specifically validates the file-read cache behavior.
+	t.Setenv("AMP_API_KEY", "")
+
 	tmpDir := t.TempDir()
 	p := filepath.Join(tmpDir, "secrets.json")
 	if err := os.WriteFile(p, []byte(`{"apiKey@https://ampcode.com/":"v1"}`), 0600); err != nil {

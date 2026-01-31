@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -206,6 +207,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
+	engine.Use(usagerecord.GinUsageRecordMiddleware())
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
@@ -351,6 +353,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
+		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
 	// Gemini compatible API routes
@@ -1056,14 +1059,17 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	s.configureUsageRecordRetention(cfg)
 
-	// Notify Amp module of config changes (for model mapping hot-reload)
-	if s.ampModule != nil {
-		log.Debugf("triggering amp module config update")
-		if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
-			log.Errorf("failed to update Amp module config: %v", err)
+	// Notify Amp module only when Amp config has changed.
+	ampConfigChanged := oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode)
+	if ampConfigChanged {
+		if s.ampModule != nil {
+			log.Debugf("triggering amp module config update")
+			if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
+				log.Errorf("failed to update Amp module config: %v", err)
+			}
+		} else {
+			log.Warnf("amp module is nil, skipping config update")
 		}
-	} else {
-		log.Warnf("amp module is nil, skipping config update")
 	}
 
 	// Count client sources from configuration and auth store.

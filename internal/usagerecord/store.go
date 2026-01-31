@@ -179,6 +179,27 @@ type Store struct {
 	kpisCache             *queryCache
 }
 
+func (s *Store) invalidateCaches() {
+	if s == nil {
+		return
+	}
+	if s.listCache != nil {
+		s.listCache.clear()
+	}
+	if s.modelStatsCache != nil {
+		s.modelStatsCache.clear()
+	}
+	if s.providerStatsCache != nil {
+		s.providerStatsCache.clear()
+	}
+	if s.intervalTimelineCache != nil {
+		s.intervalTimelineCache.clear()
+	}
+	if s.kpisCache != nil {
+		s.kpisCache.clear()
+	}
+}
+
 var (
 	defaultStore     *Store
 	defaultStoreMu   sync.Mutex
@@ -429,6 +450,7 @@ func (s *Store) Insert(ctx context.Context, record *Record) error {
 
 	id, _ := result.LastInsertId()
 	record.ID = id
+	s.invalidateCaches()
 
 	return nil
 }
@@ -535,6 +557,9 @@ func (s *Store) listUncached(ctx context.Context, query ListQuery) (*ListResult,
 		args = append(args, ParseTimeParam(query.EndTime))
 	}
 	if query.Success != nil {
+		// status_code=0 is used for in-flight records (recorded at request start).
+		// Exclude them from success/failure filters to avoid misclassification.
+		conditions = append(conditions, "status_code != 0")
 		if *query.Success {
 			conditions = append(conditions, "success = 1")
 		} else {
@@ -843,7 +868,7 @@ func (s *Store) GetActivityHeatmap(ctx context.Context, days int) (*ActivityHeat
 			COALESCE(AVG(duration_ms), 0) as avg_duration,
 			COUNT(DISTINCT model) as unique_models
 		FROM usage_records
-		WHERE substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
+		WHERE status_code != 0 AND substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
 		GROUP BY substr(timestamp, 1, 10)
 		ORDER BY day ASC
 	`
@@ -943,6 +968,8 @@ func (s *Store) getModelStatsUncached(ctx context.Context, startTime, endTime st
 	var conditions []string
 	var args []interface{}
 
+	conditions = append(conditions, "status_code != 0")
+
 	if startTime != "" {
 		conditions = append(conditions, "timestamp >= ?")
 		args = append(args, ParseTimeParam(startTime))
@@ -1029,6 +1056,8 @@ func (s *Store) GetDistinctOptions(ctx context.Context, startTime, endTime strin
 	var conditions []string
 	var args []interface{}
 
+	conditions = append(conditions, "status_code != 0")
+
 	if startTime != "" {
 		conditions = append(conditions, "timestamp >= ?")
 		args = append(args, ParseTimeParam(startTime))
@@ -1107,6 +1136,8 @@ func (s *Store) getProviderStatsUncached(ctx context.Context, startTime, endTime
 
 	var conditions []string
 	var args []interface{}
+
+	conditions = append(conditions, "status_code != 0")
 
 	if startTime != "" {
 		conditions = append(conditions, "timestamp >= ?")
@@ -1211,6 +1242,8 @@ func (s *Store) GetUsageSummary(ctx context.Context, startTime, endTime string) 
 	var conditions []string
 	var args []interface{}
 
+	conditions = append(conditions, "status_code != 0")
+
 	if startTime != "" {
 		conditions = append(conditions, "timestamp >= ?")
 		args = append(args, ParseTimeParam(startTime))
@@ -1285,6 +1318,14 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 		GeneratedAt: time.Now().Format(time.RFC3339),
 	}
 
+	// Exclude in-flight records (status_code=0) from KPIs to avoid skewing dashboards.
+	kpiWhereClause := whereClause
+	if strings.TrimSpace(kpiWhereClause) == "" {
+		kpiWhereClause = "WHERE status_code != 0"
+	} else {
+		kpiWhereClause = kpiWhereClause + " AND status_code != 0"
+	}
+
 	// Totals (based on the same filters as the list endpoint)
 	totalsQuery := fmt.Sprintf(`
 		SELECT
@@ -1296,7 +1337,7 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 			COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
 		FROM usage_records
 		%s
-	`, whereClause)
+	`, kpiWhereClause)
 
 	if err := s.db.QueryRowContext(ctx, totalsQuery, whereArgs...).Scan(
 		&kpis.TotalRequests,
@@ -1350,7 +1391,7 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 		%s
 		GROUP BY bucket_key
 		ORDER BY bucket_key ASC
-	`, keyExpr, whereClause)
+	`, keyExpr, kpiWhereClause)
 
 	rows, err := s.db.QueryContext(ctx, trendQuery, whereArgs...)
 	if err != nil {
@@ -1394,7 +1435,7 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 	windowEnd := trendEnd
 	windowStart := windowEnd.Add(-rpmWindowSeconds * time.Second)
 
-	rpmClause := strings.TrimSpace(whereClause)
+	rpmClause := strings.TrimSpace(kpiWhereClause)
 	rpmArgs := append([]interface{}{}, whereArgs...)
 	if rpmClause == "" {
 		rpmClause = "WHERE timestamp >= ? AND timestamp <= ?"
@@ -1418,7 +1459,7 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 	minEnd := windowEnd.Truncate(time.Minute)
 	minStart := minEnd.Add(-time.Duration(trendMinutes-1) * time.Minute)
 
-	minClause := strings.TrimSpace(whereClause)
+	minClause := strings.TrimSpace(kpiWhereClause)
 	minArgs := append([]interface{}{}, whereArgs...)
 	if minClause == "" {
 		minClause = "WHERE timestamp >= ? AND timestamp <= ?"
@@ -1539,6 +1580,8 @@ func (s *Store) GetRequestTimeline(ctx context.Context, startTime, endTime strin
 
 	var conditions []string
 	var args []interface{}
+
+	conditions = append(conditions, "status_code != 0")
 
 	if startTime != "" {
 		conditions = append(conditions, "timestamp >= ?")
@@ -1714,7 +1757,7 @@ func (s *Store) getIntervalTimelineUncached(ctx context.Context, hours int, limi
 	query := `
 		SELECT timestamp, model
 		FROM usage_records
-		WHERE timestamp >= ? AND success = 1
+		WHERE timestamp >= ? AND status_code != 0 AND success = 1
 		ORDER BY timestamp DESC
 		LIMIT ?
 	`

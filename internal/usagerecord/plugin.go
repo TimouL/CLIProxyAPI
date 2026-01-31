@@ -2,6 +2,7 @@ package usagerecord
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -114,6 +115,7 @@ func (p *Plugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 		responseBody    string
 		isStreaming     bool
 		durationMs      int64
+		recordDBID      int64
 		requestID       string
 		ip              string
 	)
@@ -152,6 +154,22 @@ func (p *Plugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 
 			// Get request ID using standard utility
 			requestID = logging.GetGinRequestID(ginCtx)
+
+			// Try to associate with the start-record inserted by GinUsageRecordMiddleware.
+			if v, exists := ginCtx.Get(ginUsageRecordIDKey); exists {
+				switch t := v.(type) {
+				case int64:
+					recordDBID = t
+				case int:
+					recordDBID = int64(t)
+				case float64:
+					recordDBID = int64(t)
+				case string:
+					if parsed, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64); err == nil {
+						recordDBID = parsed
+					}
+				}
+			}
 
 			// Check if streaming from context
 			if streaming, exists := ginCtx.Get("is_streaming"); exists {
@@ -196,34 +214,71 @@ func (p *Plugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 		success = false
 	}
 
-	// Create the record
-	// Always calculate total tokens as input + output (API-returned total may be inaccurate)
-	rec := &Record{
-		RequestID:       requestID,
-		Timestamp:       timestamp,
-		IP:              ip,
-		APIKey:          record.APIKey,
-		APIKeyMasked:    MaskAPIKey(record.APIKey),
-		Model:           record.Model,
-		Provider:        record.Provider,
-		IsStreaming:     isStreaming,
-		InputTokens:     record.Detail.InputTokens,
-		OutputTokens:    record.Detail.OutputTokens,
-		TotalTokens:     record.Detail.InputTokens + record.Detail.OutputTokens,
-		CachedTokens:    record.Detail.CachedTokens,
-		ReasoningTokens: record.Detail.ReasoningTokens,
-		DurationMs:      durationMs,
-		StatusCode:      statusCode,
-		Success:         success,
-		RequestURL:      requestURL,
-		RequestMethod:   requestMethod,
-		RequestHeaders:  requestHeaders,
-		RequestBody:     requestBody,
-		ResponseHeaders: responseHeaders,
-		ResponseBody:    responseBody,
+	// If GinUsageRecordMiddleware already inserted a start-record, update it in-place instead of inserting a duplicate.
+	patched := false
+	if recordDBID > 0 {
+		apiKey := record.APIKey
+		apiKeyMasked := MaskAPIKey(apiKey)
+		model := record.Model
+		provider := record.Provider
+		inputTokens := record.Detail.InputTokens
+		outputTokens := record.Detail.OutputTokens
+		totalTokens := record.Detail.InputTokens + record.Detail.OutputTokens
+		cachedTokens := record.Detail.CachedTokens
+		reasoningTokens := record.Detail.ReasoningTokens
+
+		patch := RecordPatch{
+			APIKey:          &apiKey,
+			APIKeyMasked:    &apiKeyMasked,
+			Model:           &model,
+			Provider:        &provider,
+			IsStreaming:     &isStreaming,
+			InputTokens:     &inputTokens,
+			OutputTokens:    &outputTokens,
+			TotalTokens:     &totalTokens,
+			CachedTokens:    &cachedTokens,
+			ReasoningTokens: &reasoningTokens,
+		}
+
+		patchCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := p.store.PatchByID(patchCtx, recordDBID, patch)
+		cancel()
+		if err == nil {
+			// token usage & provider/model updated; rely on GinUsageRecordMiddleware to patch status/body later.
+			patched = true
+		}
 	}
 
-	p.store.EnqueueUsageRecord(rec)
+	if !patched {
+		// Fallback: insert a new row (legacy behavior).
+		// Always calculate total tokens as input + output (API-returned total may be inaccurate)
+		rec := &Record{
+			RequestID:       requestID,
+			Timestamp:       timestamp,
+			IP:              ip,
+			APIKey:          record.APIKey,
+			APIKeyMasked:    MaskAPIKey(record.APIKey),
+			Model:           record.Model,
+			Provider:        record.Provider,
+			IsStreaming:     isStreaming,
+			InputTokens:     record.Detail.InputTokens,
+			OutputTokens:    record.Detail.OutputTokens,
+			TotalTokens:     record.Detail.InputTokens + record.Detail.OutputTokens,
+			CachedTokens:    record.Detail.CachedTokens,
+			ReasoningTokens: record.Detail.ReasoningTokens,
+			DurationMs:      durationMs,
+			StatusCode:      statusCode,
+			Success:         success,
+			RequestURL:      requestURL,
+			RequestMethod:   requestMethod,
+			RequestHeaders:  requestHeaders,
+			RequestBody:     requestBody,
+			ResponseHeaders: responseHeaders,
+			ResponseBody:    responseBody,
+		}
+
+		p.store.EnqueueUsageRecord(rec)
+	}
 
 	// Increment API key token counts if callback is set
 	if p.tokenIncrementor != nil && record.APIKey != "" {

@@ -31,6 +31,15 @@ func newQueryCache(ttl time.Duration) *queryCache {
 	}
 }
 
+func (c *queryCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.entries = make(map[string]cacheEntry)
+	c.mu.Unlock()
+}
+
 func (c *queryCache) get(key string, fn func() (any, error)) (any, error) {
 	if c == nil || c.ttl <= 0 {
 		return fn()

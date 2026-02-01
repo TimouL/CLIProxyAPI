@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usagerecord"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -41,7 +43,12 @@ func newTestServer(t *testing.T) *Server {
 	accessManager := sdkaccess.NewManager()
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	return NewServer(cfg, authManager, accessManager, configPath)
+	server := NewServer(cfg, authManager, accessManager, configPath)
+	t.Cleanup(func() {
+		_ = server.Stop(context.Background())
+		_ = usagerecord.CloseDefaultStore()
+	})
+	return server
 }
 
 func TestAmpProviderModelRoutes(t *testing.T) {

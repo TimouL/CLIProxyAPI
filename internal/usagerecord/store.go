@@ -35,7 +35,7 @@ func ParseTimeParam(param string) string {
 	// Try parsing as Unix timestamp (seconds)
 	if ts, err := strconv.ParseInt(param, 10, 64); err == nil && ts > 1000000000 && ts < 9999999999 {
 		// Valid Unix timestamp (between ~2001 and ~2286)
-		return time.Unix(ts, 0).Format(time.RFC3339)
+		return time.Unix(ts, 0).Local().Format(time.RFC3339)
 	}
 
 	// Try parsing as RFC3339 (with timezone)
@@ -75,7 +75,7 @@ func ParseTimeParamToTime(param string) time.Time {
 
 	// Try parsing as Unix timestamp (seconds)
 	if ts, err := strconv.ParseInt(param, 10, 64); err == nil && ts > 1000000000 && ts < 9999999999 {
-		return time.Unix(ts, 0)
+		return time.Unix(ts, 0).Local()
 	}
 
 	// Try parsing as RFC3339 (with timezone)
@@ -422,7 +422,7 @@ func (s *Store) Insert(ctx context.Context, record *Record) error {
 
 	result, err := s.db.ExecContext(ctx, query,
 		record.RequestID,
-		record.Timestamp.Format(time.RFC3339),
+		record.Timestamp.Local().Format(time.RFC3339),
 		record.IP,
 		record.APIKey,
 		record.APIKeyMasked,
@@ -1378,9 +1378,11 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 	aggMapRequests := make(map[string]int64)
 	aggMapTokens := make(map[string]int64)
 
-	keyExpr := "substr(timestamp, 1, 13)"
-	if bucket == "day" {
-		keyExpr = "substr(timestamp, 1, 10)"
+	keyExpr := "substr(timestamp, 1, 10)"
+	step := 24 * time.Hour
+	if bucket != "day" {
+		step = 30 * time.Minute
+		keyExpr = "substr(timestamp, 1, 14) || CASE WHEN CAST(substr(timestamp, 15, 2) AS INTEGER) < 30 THEN '00' ELSE '30' END"
 	}
 	trendQuery := fmt.Sprintf(`
 		SELECT
@@ -1404,30 +1406,21 @@ func (s *Store) getUsageKPIsUncached(ctx context.Context, whereClause string, wh
 		if err := rows.Scan(&r.key, &r.requests, &r.tokens); err != nil {
 			continue
 		}
-		label := r.key
-		if bucket == "hour" {
-			label = strings.Replace(r.key, "T", " ", 1) + ":00"
-		}
+		label := strings.Replace(r.key, "T", " ", 1)
 		aggMapRequests[label] = r.requests
 		aggMapTokens[label] = r.tokens
 	}
 
+	startTick := trendStart.Truncate(step)
+	endTick := trendEnd.Truncate(step)
+	labelLayout := "2006-01-02 15:04"
 	if bucket == "day" {
-		startDay := time.Date(trendStart.Year(), trendStart.Month(), trendStart.Day(), 0, 0, 0, 0, trendStart.Location())
-		endDay := time.Date(trendEnd.Year(), trendEnd.Month(), trendEnd.Day(), 0, 0, 0, 0, trendEnd.Location())
-		for d := startDay; !d.After(endDay); d = d.AddDate(0, 0, 1) {
-			label := d.Format("2006-01-02")
-			kpis.RequestsTrend = append(kpis.RequestsTrend, KPITrendPoint{T: label, V: aggMapRequests[label]})
-			kpis.TokensTrend = append(kpis.TokensTrend, KPITrendPoint{T: label, V: aggMapTokens[label]})
-		}
-	} else {
-		startHour := trendStart.Truncate(time.Hour)
-		endHour := trendEnd.Truncate(time.Hour)
-		for h := startHour; !h.After(endHour); h = h.Add(time.Hour) {
-			label := h.Format("2006-01-02 15:00")
-			kpis.RequestsTrend = append(kpis.RequestsTrend, KPITrendPoint{T: label, V: aggMapRequests[label]})
-			kpis.TokensTrend = append(kpis.TokensTrend, KPITrendPoint{T: label, V: aggMapTokens[label]})
-		}
+		labelLayout = "2006-01-02"
+	}
+	for t := startTick; !t.After(endTick); t = t.Add(step) {
+		label := t.Format(labelLayout)
+		kpis.RequestsTrend = append(kpis.RequestsTrend, KPITrendPoint{T: label, V: aggMapRequests[label]})
+		kpis.TokensTrend = append(kpis.TokensTrend, KPITrendPoint{T: label, V: aggMapTokens[label]})
 	}
 
 	// RPM/TPM: based on the last 60 seconds up to endTime (or now if endTime not provided).
